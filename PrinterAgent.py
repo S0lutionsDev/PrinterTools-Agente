@@ -83,7 +83,7 @@ SMTP_DEFAULT = {
 # ============================================================================
 # VERSIÓN Y AUTO-ACTUALIZACIÓN
 # ============================================================================
-AGENT_VERSION = '3.19.2'
+AGENT_VERSION = '3.20.0'
 AGENT_GITHUB_REPO   = "S0lutionsDev/PrinterTools-Agente"
 
 # ============================================================================
@@ -1883,7 +1883,11 @@ def _cmd_update_agent(params: dict, config: dict, live_printers: list, counters,
             if getattr(sys, 'frozen', False):
                 cmd_line = f'timeout /t 3 /nobreak >nul & "{sys.executable}" --run'
             else:
-                cmd_line = f'timeout /t 3 /nobreak >nul & "{sys.executable}" "{Path(__file__).resolve()}" --run'
+                target_exe = Path(__file__).resolve().parent / 'PrinterAgent.exe'
+                if target_exe.exists():
+                    cmd_line = f'timeout /t 3 /nobreak >nul & "{target_exe}" --run'
+                else:
+                    cmd_line = f'timeout /t 3 /nobreak >nul & "{sys.executable}" "{Path(__file__).resolve()}" --run'
             subprocess.Popen(
                 ["cmd.exe", "/c", cmd_line],
                 creationflags=cflags
@@ -3582,29 +3586,83 @@ def check_and_apply_agent_auto_update(force: bool = False, verbose: bool = False
             except Exception:
                 pass
         if not getattr(sys, 'frozen', False):
-            # === MODO SCRIPT .PY: Actualización de archivos fuente ===
-            # Para agentes desplegados como scripts Python (no empaquetados con PyInstaller),
-            # descargamos PrinterAgent.py y snmp_utils.py actualizados directamente del repositorio GitHub.
+            # === MODO SCRIPT .PY: Migración y actualización directa a PrinterAgent.exe ===
+            # Descarga el binario oficial compilado PrinterAgent.exe, migra la tarea de Windows,
+            # finaliza los procesos Python residuales e inicia el nuevo ejecutable nativo.
             try:
                 script_path = Path(__file__).resolve()
                 script_dir = script_path.parent
+                target_exe = script_dir / 'PrinterAgent.exe'
 
                 import urllib.request
                 import ssl
-                ctx_py = ssl.create_default_context()
-                try:
-                    # Intentar con verificación SSL normal
-                    urllib.request.urlopen(urllib.request.Request(
-                        f"https://api.github.com/repos/{AGENT_GITHUB_REPO}/releases/latest",
-                        headers={"User-Agent": f"PrinterAgent/{AGENT_VERSION}", "Accept": "application/vnd.github.v3+json"}
-                    ), timeout=10, context=ctx_py)
-                except (ssl.SSLError, urllib.error.URLError):
-                    ctx_py = ssl.create_default_context()
-                    ctx_py.check_hostname = False
-                    ctx_py.verify_mode = ssl.CERT_NONE
+                ctx_dl = ssl.create_default_context()
+                ctx_dl.check_hostname = False
+                ctx_dl.verify_mode = ssl.CERT_NONE
 
                 server_target = str(config.get('multisite_server_url') or config.get('server_url') or 'https://printmonitor.com.ar').rstrip('/')
-                # Descargar archivos fuente crudos directamente desde el servidor SaaS o GitHub
+                exe_download_urls = [
+                    f"{server_target}/download/agent",
+                    "https://printmonitor.com.ar/download/agent",
+                    f"https://github.com/{AGENT_GITHUB_REPO}/releases/latest/download/PrinterAgent.exe",
+                    f"https://github.com/{AGENT_GITHUB_REPO}/releases/download/v{AGENT_VERSION}/PrinterAgent.exe"
+                ]
+
+                exe_bytes = None
+                for dl_url in exe_download_urls:
+                    try:
+                        log.info(f"Intentando descargar PrinterAgent.exe desde: {dl_url}")
+                        req_exe = urllib.request.Request(dl_url, headers={"User-Agent": f"PrinterAgent/{AGENT_VERSION}"})
+                        with urllib.request.urlopen(req_exe, timeout=45, context=ctx_dl) as resp:
+                            if resp.status == 200:
+                                data = resp.read()
+                                # Validar PE header (MZ) y tamaño mínimo (> 5 MB)
+                                if len(data) > 5 * 1024 * 1024 and data[:2] == b'MZ':
+                                    exe_bytes = data
+                                    log.info(f"✅ PrinterAgent.exe descargado exitosamente ({len(data)} bytes) desde {dl_url}")
+                                    break
+                    except Exception as e_url:
+                        log.warning(f"Fallo al descargar ejecutable desde {dl_url}: {e_url}")
+                        continue
+
+                if exe_bytes:
+                    # Guardar archivo .exe
+                    tmp_exe = script_dir / f"PrinterAgent_mig_{int(time.time())}.tmp"
+                    with open(tmp_exe, 'wb') as f_out:
+                        f_out.write(exe_bytes)
+                        f_out.flush()
+                        os.fsync(f_out.fileno())
+
+                    # Mover de forma segura a PrinterAgent.exe
+                    cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                    subprocess.run(['cmd.exe', '/c', 'move', '/y', str(tmp_exe), str(target_exe)], capture_output=True, text=True, creationflags=cflags)
+
+                    # Reconfigurar tarea programada de Windows si existe
+                    try:
+                        sch_cmd = f'schtasks /create /tn "PrinterAgent" /tr "\"{target_exe}\" --run" /sc minute /mo 15 /f'
+                        subprocess.run(['cmd.exe', '/c', sch_cmd], capture_output=True, text=True, creationflags=cflags)
+                    except Exception:
+                        pass
+
+                    # Detener procesos python residuales y lanzar PrinterAgent.exe
+                    try:
+                        kill_and_run_cmd = (
+                            f'timeout /t 3 /nobreak >nul & '
+                            f'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like \'*PrinterAgent.py*\' }} | Stop-Process -Force" & '
+                            f'start "" "{target_exe}" --run'
+                        )
+                        subprocess.Popen(["cmd.exe", "/c", kill_and_run_cmd], creationflags=cflags)
+                    except Exception as e_krun:
+                        log.warning(f"Error programando inicio del ejecutable: {e_krun}")
+
+                    msg = f"Modo script migrado exitosamente: PrinterAgent.exe instalado ({len(exe_bytes)} bytes) e iniciado."
+                    log.info(msg)
+                    if verbose:
+                        print(f"[OK] {msg}")
+                    return True, msg
+
+                # Fallback: Si no se pudo descargar el .exe, intentar actualizar los scripts .py
+                log.warning("Descarga de .exe no disponible, aplicando fallback a actualización de scripts .py...")
                 files_to_update = ["PrinterAgent.py", "snmp_utils.py"]
                 updated_files = []
 
