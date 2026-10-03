@@ -1,0 +1,7 @@
+﻿*.exe
+*.tmp
+*.old
+*.bak
+*.pyc
+__pycache__/
+.pytest_cache/
