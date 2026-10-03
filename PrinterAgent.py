@@ -1880,9 +1880,12 @@ def _cmd_update_agent(params: dict, config: dict, live_printers: list, counters,
     log.info(f"Resultado actualización remota del agente: ok={ok}, msg={msg}")
     if ok:
         try:
-            exe_target = sys.executable if getattr(sys, 'frozen', False) else str(Path(__file__).resolve())
+            if getattr(sys, 'frozen', False):
+                cmd_line = f'timeout /t 3 /nobreak >nul & "{sys.executable}" --run'
+            else:
+                cmd_line = f'timeout /t 3 /nobreak >nul & "{sys.executable}" "{Path(__file__).resolve()}" --run'
             subprocess.Popen(
-                ["cmd.exe", "/c", f"timeout /t 3 /nobreak >nul & \"{exe_target}\" --run"],
+                ["cmd.exe", "/c", cmd_line],
                 creationflags=cflags
             )
         except Exception as e_launch:
