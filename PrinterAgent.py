@@ -287,9 +287,9 @@ DEFAULT_CONFIG = {
     'snmp_timeout':           0.8,
     'snmp_port':              161,
 
-    # Sincronización Multi-Sede (Panel Central NOC)
-    'multisite_enabled':    False,
-    'multisite_server_url': 'http://127.0.0.1:8088',
+    # Sincronización Multi-Sede (Panel Central NOC / VPS PrintMonitor)
+    'multisite_enabled':    True,
+    'multisite_server_url': 'https://printmonitor.com.ar',
     'multisite_token':      '',
     'multisite_site_name':  '',
     'multisite_client_id':  '',
@@ -4402,33 +4402,53 @@ def show_agent_config_gui(initial_config=None):
             except Exception:
                 pass
 
-        target_dirs = [BASE_DIR]
+        target_dirs = [INSTALL_DIR, BASE_DIR]
+
+        # Si se ejecuta fuera de C:\PrinterTools-Agente, copiar/actualizar el ejecutable en C:\PrinterTools-Agente
         try:
-            exe_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
-            if exe_dir not in target_dirs:
-                target_dirs.insert(0, exe_dir)
-        except Exception:
-            pass
+            INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            src_exe = Path(sys.executable) if getattr(sys, 'frozen', False) else Path(__file__).resolve()
+            dst_exe = INSTALL_DIR / 'PrinterAgent.exe'
+            if getattr(sys, 'frozen', False) and src_exe.resolve() != dst_exe.resolve():
+                import stat
+                with open(src_exe, 'rb') as f_src:
+                    b_data = f_src.read()
+                m_pos = b_data.rfind(AGENT_CONFIG_MARKER)
+                c_bytes = b_data[:m_pos] if m_pos > 0 else b_data
+                if dst_exe.exists():
+                    try:
+                        os.chmod(dst_exe, stat.S_IWRITE | stat.S_IREAD)
+                    except Exception:
+                        pass
+                for attempt in range(5):
+                    try:
+                        with open(dst_exe, 'wb') as f_dst:
+                            f_dst.write(c_bytes)
+                        break
+                    except Exception:
+                        time.sleep(0.3)
+        except Exception as ex_cp:
+            log.warning(f"No se pudo copiar a {INSTALL_DIR}: {ex_cp}")
 
         save_cfg = crypto_utils.protect_config(new_cfg) if crypto_utils else new_cfg
-        saved_paths = []
         for d in target_dirs:
             try:
-                d.mkdir(exist_ok=True)
+                d.mkdir(parents=True, exist_ok=True)
                 for fname in ['config.json', 'agent_config.json']:
                     p = d / fname
                     with open(p, 'w', encoding='utf-8') as f:
                         json.dump(save_cfg, f, indent=2, ensure_ascii=False)
-                saved_paths.append(str(d / 'config.json'))
             except Exception as ex_s:
                 log.error(f"Error al guardar en {d}: {ex_s}")
 
-        messagebox.showinfo("Configuración Guardada", f"Configuración guardada exitosamente en:\n{saved_paths[0]}", parent=root)
+        messagebox.showinfo("Configuración Guardada", f"Configuración guardada exitosamente en:\n{INSTALL_DIR / 'config.json'}\n\nEl agente quedó vinculado en C:\\PrinterTools-Agente.", parent=root)
 
     def on_install_task():
         on_save_config()
-        exe = sys.executable if sys.executable.endswith('.exe') else str(Path(sys.argv[0]).resolve())
-        short_exe = get_windows_short_path(exe)
+        target_exe = INSTALL_DIR / 'PrinterAgent.exe'
+        if not target_exe.exists():
+            target_exe = Path(sys.executable) if sys.executable.endswith('.exe') else Path(sys.argv[0]).resolve()
+        short_exe = get_windows_short_path(str(target_exe))
         target_tr = f'"{short_exe}" --run' if ' ' in short_exe else f'{short_exe} --run'
         interval = 5
         try:
@@ -4976,80 +4996,285 @@ def _run_quick_migration(curr_cfg: dict):
         pass
 
 
-def _run_quick_migration_dialog(curr_cfg: dict):
-    """Ventana visual que ofrece actualización automática en 1 clic si se ejecuta desde Descargas u otra carpeta."""
+def _run_generic_installer(curr_cfg: dict = None):
+    """Instalador visual de PrinterAgent cuando se ejecuta fuera de C:\\PrinterTools-Agente (ej. Descargas)."""
+    import ctypes
+    import stat
+    import time
+    import threading
+
+    # 1. Asegurar privilegios de administrador antes de abrir la interfaz gráfica
+    is_admin = False
+    try:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        pass
+
+    if not is_admin and getattr(sys, 'frozen', False):
+        try:
+            params = " ".join(f'"{a}"' for a in sys.argv[1:])
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1
+            )
+            sys.exit(0)
+        except Exception:
+            pass
+
+    cfg = curr_cfg or load_full_config()
+
     try:
         import tkinter as tk
-        from tkinter import messagebox
+        from tkinter import ttk, messagebox
     except Exception:
-        return _run_quick_migration(curr_cfg)
+        return _run_quick_migration(cfg)
 
-    sname = curr_cfg.get('client_name') or curr_cfg.get('site_name') or 'Sede Configurada'
-    cid = curr_cfg.get('multisite_client_id') or curr_cfg.get('client_id') or ''
+    existing_tok = cfg.get('multisite_token') or (cfg.get('multisite', {}).get('auth_token') if isinstance(cfg.get('multisite'), dict) else '') or ''
+    existing_name = cfg.get('client_name') or cfg.get('multisite_site_name') or ''
+    is_update = bool(existing_tok)
 
     root = tk.Tk()
-    root.title(f"Actualizador de Agente PrintMonitor v{AGENT_VERSION}")
-    root.geometry("520x280")
+    root.title(f"{'Actualizador' if is_update else 'Instalador'} de Agente — PrintMonitor v{AGENT_VERSION}")
+    root.geometry("520x460")
     root.resizable(False, False)
     root.configure(bg="#0f172a")
 
     root.update_idletasks()
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
-    x = (sw - 520) // 2
-    y = (sh - 280) // 2
+    x = max(0, (sw - 520) // 2)
+    y = max(0, (sh - 460) // 2)
     root.geometry(f"+{x}+{y}")
 
-    hdr = tk.Frame(root, bg="#1e293b", padx=16, pady=12)
+    # Header Card
+    hdr = tk.Frame(root, bg="#1e293b", padx=18, pady=12)
     hdr.pack(fill='x')
-    tk.Label(hdr, text=f"🔄 Actualización a PrintMonitor v{AGENT_VERSION}",
-             font=("Segoe UI", 11, "bold"), fg="#38bdf8", bg="#1e293b").pack(anchor='w')
-    tk.Label(hdr, text=f"Sede: {sname} (ID: {cid})",
-             font=("Segoe UI", 8), fg="#94a3b8", bg="#1e293b").pack(anchor='w', pady=(2, 0))
+    hdr_title = f"🔄 Actualizar a PrintMonitor v{AGENT_VERSION}" if is_update else f"📦 Instalador de Agente de Monitoreo (v{AGENT_VERSION})"
+    hdr_sub = f"Sede detectada: {existing_name or 'Configurada'} (ID: {existing_tok[:16]}...)" if is_update else f"Instalación limpia y permanente en C:\\PrinterTools-Agente"
+    tk.Label(hdr, text=hdr_title, font=("Segoe UI", 11, "bold"), fg="#38bdf8", bg="#1e293b").pack(anchor='w')
+    tk.Label(hdr, text=hdr_sub, font=("Segoe UI", 8), fg="#94a3b8", bg="#1e293b").pack(anchor='w', pady=(2, 0))
 
+    # Body
     body = tk.Frame(root, bg="#0f172a", padx=20, pady=14)
     body.pack(fill='both', expand=True)
 
-    tk.Label(body, text="Se detectó una configuración previa de esta sede en el equipo.",
-             font=("Segoe UI", 9, "bold"), fg="#f8fafc", bg="#0f172a").pack(anchor='w')
-    tk.Label(body,
-             text="Al actualizar, se detendrán scripts antiguos (.py), se instalará el binario v3.21 en C:\\PrinterTools-Agente y se activará el servicio automático de Windows.",
-             font=("Segoe UI", 8), fg="#94a3b8", bg="#0f172a", wraplength=480, justify='left').pack(anchor='w', pady=(6, 14))
+    # Campo 1: URL Servidor VPS
+    tk.Label(body, text="URL Servidor Central NOC / VPS:", font=("Segoe UI", 8, "bold"), fg="#f8fafc", bg="#0f172a").pack(anchor='w', pady=(0, 2))
+    e_url = tk.Entry(body, font=("Segoe UI", 9), bg="#1e293b", fg="#f8fafc", insertbackground="white",
+                     relief='flat', highlightthickness=1, highlightbackground="#334155")
+    e_url.pack(fill='x', pady=(0, 10))
+    e_url.insert(0, cfg.get('multisite_server_url') or 'https://printmonitor.com.ar')
 
-    def do_update():
-        root.destroy()
-        _run_quick_migration(curr_cfg)
-        try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                f"¡Agente actualizado a v{AGENT_VERSION} con éxito!\n\nSe instaló en C:\\PrinterTools-Agente\\PrinterAgent.exe y el servicio de Windows ya está reportando a PrintMonitor.",
-                "Actualización Completada",
-                0x40
-            )
-        except Exception:
-            pass
-        sys.exit(0)
+    # Campo 2: Token de Sede
+    tk.Label(body, text="Token de Seguridad de la Sede *:", font=("Segoe UI", 8, "bold"), fg="#38bdf8", bg="#0f172a").pack(anchor='w', pady=(0, 2))
+    e_tok = tk.Entry(body, font=("Segoe UI", 9), bg="#1e293b", fg="#f8fafc", insertbackground="white",
+                     relief='flat', highlightthickness=1, highlightbackground="#334155")
+    e_tok.pack(fill='x', pady=(0, 10))
+    e_tok.insert(0, existing_tok)
 
-    def do_manual():
-        root.destroy()
-        show_agent_config_gui(curr_cfg)
-        sys.exit(0)
+    # Campo 3: Nombre de Empresa / Sede
+    tk.Label(body, text="Nombre de Empresa / Sede:", font=("Segoe UI", 8), fg="#94a3b8", bg="#0f172a").pack(anchor='w', pady=(0, 2))
+    e_cli = tk.Entry(body, font=("Segoe UI", 9), bg="#1e293b", fg="#f8fafc", insertbackground="white",
+                     relief='flat', highlightthickness=1, highlightbackground="#334155")
+    e_cli.pack(fill='x', pady=(0, 10))
+    e_cli.insert(0, existing_name)
+
+    # Campo 4: Intervalo
+    f_row = tk.Frame(body, bg="#0f172a")
+    f_row.pack(fill='x', pady=(0, 12))
+    tk.Label(f_row, text="Intervalo de Monitoreo:", font=("Segoe UI", 8), fg="#94a3b8", bg="#0f172a").pack(side='left')
+    cb_int = ttk.Combobox(f_row, values=["5 minutos (Recomendado)", "10 minutos", "15 minutos"], state="readonly", width=24)
+    cb_int.pack(side='right')
+    cb_int.set("5 minutos (Recomendado)")
+
+    # Estado y progreso
+    initial_step = f"ℹ️ Sede detectada: '{existing_name or 'Configurada'}'. Pulse el botón para actualizar e iniciar." if is_update else "Pegue el Token de la Sede y pulse Instalar para comenzar."
+    lbl_step = tk.Label(body, text=initial_step,
+                        font=("Segoe UI", 8, "bold"), fg="#38bdf8" if is_update else "#94a3b8", bg="#0f172a")
+    lbl_step.pack(anchor='w', pady=(4, 4))
+
+    pbar = ttk.Progressbar(body, mode='determinate', maximum=100)
+    pbar.pack(fill='x', pady=(0, 14))
+    pbar['value'] = 0
 
     btn_box = tk.Frame(body, bg="#0f172a")
     btn_box.pack(fill='x', side='bottom')
 
-    btn_mig = tk.Button(btn_box, text="🚀 Actualizar en 1 Clic e Iniciar", font=("Segoe UI", 9, "bold"),
-                        bg="#16a34a", activebackground="#15803d", fg="white", relief='flat', padx=14, pady=6,
-                        cursor='hand2', command=do_update)
-    btn_mig.pack(side='left', fill='x', expand=True, padx=(0, 6))
+    btn_close = tk.Button(btn_box, text="Cerrar", font=("Segoe UI", 9),
+                          bg="#334155", fg="#94a3b8", relief='flat', padx=14, pady=6,
+                          command=root.destroy)
+    btn_close.pack(side='right', padx=(6, 0))
 
-    btn_cfg = tk.Button(btn_box, text="⚙️ Abrir Configurador Manual", font=("Segoe UI", 9),
-                        bg="#334155", activebackground="#475569", fg="#f8fafc", relief='flat', padx=10, pady=6,
-                        cursor='hand2', command=do_manual)
-    btn_cfg.pack(side='left', fill='x', expand=True, padx=(6, 0))
+    def update_ui(step_text, val):
+        lbl_step.config(text=step_text, fg="#38bdf8")
+        pbar['value'] = val
+
+    def start_install():
+        tok = e_tok.get().strip()
+        url = e_url.get().strip().rstrip('/') or 'https://printmonitor.com.ar'
+        cli = e_cli.get().strip() or 'Sede Monitoreo'
+
+        if not tok:
+            messagebox.showwarning(
+                "Token Requerido",
+                "Por favor ingrese o pegue el Token de la Sede antes de continuar.\n\nPuede obtenerlo desde el panel web de PrintMonitor.",
+                parent=root
+            )
+            e_tok.focus_set()
+            return
+
+        btn_install.config(state='disabled', text="⏳ Instalando...")
+        btn_close.config(state='disabled')
+
+        def worker():
+            cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            cur_pid = os.getpid()
+
+            try:
+                # Paso 1: Crear directorio de destino oficial C:\PrinterTools-Agente
+                root.after(0, lambda: update_ui("[1/4] Creando directorio C:\\PrinterTools-Agente...", 25))
+                INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+                time.sleep(0.3)
+
+                # Paso 2: Detener procesos previos y tareas viejas
+                root.after(0, lambda: update_ui("[2/4] Deteniendo agentes previos, scripts antiguos y tareas...", 50))
+                for tn in ['PrinterAgent_SolutionsDev', 'PrinterAgent']:
+                    try:
+                        subprocess.run(['schtasks', '/end', '/tn', tn], capture_output=True, creationflags=cflags)
+                        subprocess.run(['schtasks', '/delete', '/tn', tn, '/f'], capture_output=True, creationflags=cflags)
+                    except Exception:
+                        pass
+
+                try:
+                    subprocess.run(['taskkill', '/F', '/FI', f'PID ne {cur_pid}', '/IM', 'PrinterAgent.exe'],
+                                   capture_output=True, creationflags=cflags)
+                except Exception:
+                    pass
+
+                try:
+                    ps_k = "Get-CimInstance Win32_Process | Where-Object { ($_.Name -like 'python*' -and $_.CommandLine -like '*PrinterAgent*') } | Stop-Process -Force"
+                    subprocess.run(['powershell', '-NoProfile', '-Command', ps_k], capture_output=True, creationflags=cflags)
+                except Exception:
+                    pass
+                time.sleep(0.8)
+
+                # Paso 3: Copiar binario limpio a C:\PrinterTools-Agente\PrinterAgent.exe
+                root.after(0, lambda: update_ui("[3/4] Copiando ejecutable y escribiendo configuración...", 75))
+                src_exe = Path(sys.executable) if getattr(sys, 'frozen', False) else Path(__file__).resolve()
+                dst_exe = INSTALL_DIR / 'PrinterAgent.exe'
+
+                if getattr(sys, 'frozen', False) and src_exe.resolve() != dst_exe.resolve():
+                    with open(src_exe, 'rb') as f:
+                        b_all = f.read()
+                    m_idx = b_all.rfind(AGENT_CONFIG_MARKER)
+                    clean_b = b_all[:m_idx] if m_idx > 0 else b_all
+                    if dst_exe.exists():
+                        try:
+                            os.chmod(dst_exe, stat.S_IWRITE | stat.S_IREAD)
+                        except Exception:
+                            pass
+                    for attempt in range(5):
+                        try:
+                            with open(dst_exe, 'wb') as f:
+                                f.write(clean_b)
+                            break
+                        except Exception:
+                            try:
+                                old_tmp = INSTALL_DIR / f'PrinterAgent_old_{attempt}.tmp'
+                                if dst_exe.exists():
+                                    os.replace(dst_exe, old_tmp)
+                                    with open(dst_exe, 'wb') as f:
+                                        f.write(clean_b)
+                                    try:
+                                        old_tmp.unlink()
+                                    except Exception:
+                                        pass
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.4)
+
+                # Guardar configuración (ÚNICAMENTE en C:\PrinterTools-Agente y ~/.printer_repair, NUNCA en Descargas)
+                mins = 5
+                try:
+                    mins = int(cb_int.get().split()[0])
+                except Exception:
+                    pass
+
+                new_cfg = cfg.copy()
+                new_cfg['client_name'] = cli
+                new_cfg['multisite_enabled'] = True
+                new_cfg['multisite_server_url'] = url
+                new_cfg['multisite_token'] = tok
+                new_cfg['multisite_client_id'] = tok
+                new_cfg['multisite_site_name'] = cli
+                new_cfg['check_interval_minutes'] = mins
+                new_cfg['multisite'] = {
+                    'enabled': True,
+                    'server_url': url,
+                    'client_id': tok,
+                    'site_name': cli,
+                    'auth_token': tok,
+                    'push_interval_sec': mins * 60
+                }
+
+                save_c = crypto_utils.protect_config(new_cfg) if crypto_utils else new_cfg
+                for d in [INSTALL_DIR, BASE_DIR]:
+                    try:
+                        d.mkdir(parents=True, exist_ok=True)
+                        for fn in ['config.json', 'agent_config.json']:
+                            with open(d / fn, 'w', encoding='utf-8') as f:
+                                json.dump(save_c, f, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+                # Paso 4: Tarea programada en Windows apuntando al binario instalado
+                root.after(0, lambda: update_ui("[4/4] Configurando servicio automático en Windows...", 90))
+                target_exe = dst_exe if dst_exe.exists() else src_exe
+                short_exe = get_windows_short_path(str(target_exe))
+                target_tr = f'"{short_exe}" --run' if ' ' in short_exe else f'{short_exe} --run'
+                cmds = [
+                    ['schtasks', '/create', '/tn', 'PrinterAgent_SolutionsDev', '/tr', target_tr, '/sc', 'MINUTE', '/mo', str(mins), '/ru', 'SYSTEM', '/f'],
+                    ['schtasks', '/create', '/tn', 'PrinterAgent_SolutionsDev', '/tr', target_tr, '/sc', 'MINUTE', '/mo', str(mins), '/rl', 'HIGHEST', '/f'],
+                    ['schtasks', '/create', '/tn', 'PrinterAgent_SolutionsDev', '/tr', target_tr, '/sc', 'MINUTE', '/mo', str(mins), '/f']
+                ]
+                for cmd in cmds:
+                    r = subprocess.run(cmd, capture_output=True, creationflags=cflags)
+                    if r.returncode == 0:
+                        break
+
+                # Iniciar el agente en segundo plano
+                try:
+                    subprocess.Popen([str(target_exe), '--run'], creationflags=cflags)
+                except Exception:
+                    pass
+
+                def on_done():
+                    lbl_step.config(text="✅ ¡Instalación Completada con Éxito! El agente ya está activo.", fg="#22c55e")
+                    pbar['value'] = 100
+                    btn_install.config(text="Listo", state='normal', bg="#16a34a", command=root.destroy)
+                    btn_close.pack_forget()
+
+                root.after(0, on_done)
+
+            except Exception as e_w:
+                def on_err(err=e_w):
+                    lbl_step.config(text=f"❌ Error: {err}", fg="#ef4444")
+                    btn_install.config(state='normal', text="Reintentar")
+                    btn_close.config(state='normal')
+                root.after(0, on_err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    btn_lbl = "🚀 Actualizar e Iniciar Agente" if is_update else "🚀 Instalar Agente y Activar Servicio"
+    btn_install = tk.Button(btn_box, text=btn_lbl, font=("Segoe UI", 9, "bold"),
+                            bg="#16a34a" if is_update else "#2563eb",
+                            activebackground="#15803d" if is_update else "#1d4ed8",
+                            fg="white", relief='flat', padx=14, pady=6,
+                            cursor='hand2', command=start_install)
+    btn_install.pack(side='left', fill='x', expand=True)
 
     root.mainloop()
+    sys.exit(0)
 
 
 # ============================================================================
@@ -5223,23 +5448,19 @@ if __name__ == '__main__':
     elif len(sys.argv) == 1:
         # Si se hace doble clic directo (sin argumentos) desde el Explorador de Windows:
         curr_cfg = load_full_config()
-        has_site = bool(
-            curr_cfg.get('multisite_client_id')
-            or curr_cfg.get('multisite_token')
-            or (curr_cfg.get('multisite') and curr_cfg.get('multisite', {}).get('auth_token'))
-        )
-        # Si ya existe una sede configurada en esta PC y el ejecutable NO está en C:\PrinterTools-Agente
-        # (por ejemplo se descargó a la carpeta Descargas desde https://printmonitor.com.ar/download/agent),
-        # ofrecer actualización y migración automática en 1 clic.
-        if has_site and getattr(sys, 'frozen', False):
+
+        # Si se ejecuta fuera de C:\PrinterTools-Agente (ej. en Descargas, Escritorio, pendrive),
+        # actuar SIEMPRE como instalador interactivo autónomo (igual que el descargado para cada sede)
+        if getattr(sys, 'frozen', False):
             try:
                 is_same = Path(sys.executable).resolve() == (INSTALL_DIR / 'PrinterAgent.exe').resolve()
             except Exception:
                 is_same = False
             if not is_same:
-                _run_quick_migration_dialog(curr_cfg)
+                _run_generic_installer(curr_cfg)
                 sys.exit(0)
 
+        # Si ya se encuentra instalado en C:\PrinterTools-Agente, abrir panel de control / estado del agente
         show_agent_config_gui(curr_cfg)
         sys.exit(0)
 
