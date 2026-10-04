@@ -5292,24 +5292,19 @@ if __name__ == '__main__':
         except Exception:
             pass
 
-    # MATAR AGENTES VIEJOS ANTES DE CORRER PARA EVITAR CONFLICTOS DE OTA/PYTHON
-    import subprocess
+    # Detener instancias huérfanas previas usando psutil (sin invocar wmic ni shells)
     _curr_pid = os.getpid()
     try:
-        subprocess.run(f'taskkill /F /IM PrinterAgent.exe /FI "PID ne {_curr_pid}"', shell=True, capture_output=True)
-        _r = subprocess.run('wmic process where "name=\'python.exe\' or name=\'pythonw.exe\'" get ProcessId,CommandLine', shell=True, capture_output=True, text=True, errors='replace')
-        for _line in _r.stdout.splitlines():
-            _line = _line.strip()
-            if not _line or 'ProcessId' in _line:
-                continue
-            if 'printeragent' in _line.lower():
-                _parts = _line.split()
-                if _parts:
-                    _pid_str = _parts[-1]
-                    if _pid_str.isdigit():
-                        _pid = int(_pid_str)
-                        if _pid != _curr_pid:
-                            subprocess.run(f'taskkill /F /PID {_pid}', shell=True, capture_output=True)
+        import psutil
+        for _proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if _proc.info.get('pid') != _curr_pid:
+                    _pname = (_proc.info.get('name') or '').lower()
+                    _cmdline = " ".join(_proc.info.get('cmdline') or []).lower()
+                    if _pname == 'printeragent.exe' or ('python' in _pname and 'printeragent' in _cmdline):
+                        _proc.kill()
+            except Exception:
+                pass
     except Exception:
         pass
 
