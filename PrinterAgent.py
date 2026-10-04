@@ -1656,8 +1656,11 @@ def _is_printer_ignored(p: dict, ignored_list: list) -> bool:
     p_mod = str(p.get('model') or p.get('printer_name') or p.get('name') or '').strip().lower()
 
     for ign in ignored_list:
-        if not isinstance(ign, dict):
+        # Si fue purgada por indicación del NOC pero actualmente responde ONLINE en la red/USB,
+        # no debe ignorarse para permitir su auto-recuperación y telemetría activa
+        if ign.get('reason') == 'purged_by_noc' and p.get('is_online') is True:
             continue
+
         ign_ip = str(ign.get('ip') or '').strip().lower()
         ign_ser = str(ign.get('serial') or '').strip().lower()
         ign_port = str(ign.get('port') or '').strip().lower()
