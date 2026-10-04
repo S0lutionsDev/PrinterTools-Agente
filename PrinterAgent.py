@@ -4444,7 +4444,38 @@ def show_agent_config_gui(initial_config=None):
             except Exception as ex_s:
                 log.error(f"Error al guardar en {d}: {ex_s}")
 
-        messagebox.showinfo("Configuración Guardada", f"Configuración guardada exitosamente en:\n{INSTALL_DIR / 'config.json'}\n\nEl agente quedó vinculado en C:\\PrinterTools-Agente.", parent=root)
+        # Asegurar e instalar automáticamente el servicio programado de Windows
+        svc_ok = False
+        try:
+            target_exe = INSTALL_DIR / 'PrinterAgent.exe'
+            if not target_exe.exists():
+                target_exe = Path(sys.executable) if sys.executable.endswith('.exe') else Path(sys.argv[0]).resolve()
+            short_exe = get_windows_short_path(str(target_exe))
+            target_tr = f'"{short_exe}" --run' if ' ' in short_exe else f'{short_exe} --run'
+            interval = 5
+            try:
+                interval = int(cb_noc_interval.get().split()[0])
+            except Exception:
+                pass
+            cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            for cmd in [
+                ['schtasks', '/create', '/tn', 'PrinterAgent_SolutionsDev', '/tr', target_tr, '/sc', 'MINUTE', '/mo', str(interval), '/ru', 'SYSTEM', '/f'],
+                ['schtasks', '/create', '/tn', 'PrinterAgent_SolutionsDev', '/tr', target_tr, '/sc', 'MINUTE', '/mo', str(interval), '/rl', 'HIGHEST', '/f'],
+                ['schtasks', '/create', '/tn', 'PrinterAgent_SolutionsDev', '/tr', target_tr, '/sc', 'MINUTE', '/mo', str(interval), '/f']
+            ]:
+                if subprocess.run(cmd, capture_output=True, creationflags=cflags).returncode == 0:
+                    svc_ok = True
+                    break
+            refresh_service_badge()
+        except Exception as ex_svc:
+            log.warning(f"No se pudo asegurar servicio automático: {ex_svc}")
+
+        msg_extra = f"\n\n⚡ Servicio de Windows activado (reportará cada {interval} min)." if svc_ok else ""
+        messagebox.showinfo(
+            "Configuración Guardada",
+            f"Configuración guardada exitosamente en:\n{INSTALL_DIR / 'config.json'}{msg_extra}",
+            parent=root
+        )
 
     def on_install_task():
         on_save_config()
