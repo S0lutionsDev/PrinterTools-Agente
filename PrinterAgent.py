@@ -83,7 +83,7 @@ SMTP_DEFAULT = {
 # ============================================================================
 # VERSIÓN Y AUTO-ACTUALIZACIÓN
 # ============================================================================
-AGENT_VERSION = '3.20.0'
+AGENT_VERSION = '3.21.0'
 AGENT_GITHUB_REPO   = "S0lutionsDev/PrinterTools-Agente"
 
 # ============================================================================
@@ -1876,7 +1876,7 @@ def _cmd_device_configure_hardware(params: dict, config: dict, live_printers: li
 
 def _cmd_update_agent(params: dict, config: dict, live_printers: list, counters, cflags: int) -> tuple:
     log.info("Orden de actualización forzada del agente recibida desde el panel NOC.")
-    ok, msg = check_and_apply_agent_auto_update(force=True)
+    ok, msg = check_and_apply_agent_auto_update(force=True, config=config)
     log.info(f"Resultado actualización remota del agente: ok={ok}, msg={msg}")
     if ok:
         try:
@@ -3571,7 +3571,7 @@ def sync_multisite_telemetry(config: dict, printers: list, usb_printers: list, c
                         time.sleep(1)
 
 
-def check_and_apply_agent_auto_update(force: bool = False, verbose: bool = False) -> tuple:
+def check_and_apply_agent_auto_update(force: bool = False, verbose: bool = False, config: dict = None) -> tuple:
     """Consulta GitHub Releases y actualiza PrinterAgent.exe si hay versión nueva (o si force=True).
     Retorna (éxito: bool, mensaje: str).
     """
@@ -3585,6 +3585,13 @@ def check_and_apply_agent_auto_update(force: bool = False, verbose: bool = False
                 orphan.unlink()
             except Exception:
                 pass
+
+        if config is None:
+            try:
+                config = load_full_config()
+            except Exception:
+                config = {}
+
         if not getattr(sys, 'frozen', False):
             # === MODO SCRIPT .PY: Migración y actualización directa a PrinterAgent.exe ===
             # Descarga el binario oficial compilado PrinterAgent.exe, migra la tarea de Windows,
@@ -3599,13 +3606,16 @@ def check_and_apply_agent_auto_update(force: bool = False, verbose: bool = False
                 ctx_dl = ssl.create_default_context()
                 ctx_dl.check_hostname = False
                 ctx_dl.verify_mode = ssl.CERT_NONE
+                ctx_py = ctx_dl  # Asegura que ctx_py esté siempre definido para el fallback de scripts .py
 
-                server_target = str(config.get('multisite_server_url') or config.get('server_url') or 'https://printmonitor.com.ar').rstrip('/')
+                server_target = str((config or {}).get('multisite_server_url') or (config or {}).get('server_url') or 'https://printmonitor.com.ar').rstrip('/')
+                short_ver = AGENT_VERSION.rsplit('.', 1)[0] if AGENT_VERSION.count('.') >= 2 else AGENT_VERSION
                 exe_download_urls = [
                     f"{server_target}/download/agent",
                     "https://printmonitor.com.ar/download/agent",
                     f"https://github.com/{AGENT_GITHUB_REPO}/releases/latest/download/PrinterAgent.exe",
-                    f"https://github.com/{AGENT_GITHUB_REPO}/releases/download/v{AGENT_VERSION}/PrinterAgent.exe"
+                    f"https://github.com/{AGENT_GITHUB_REPO}/releases/download/v{AGENT_VERSION}/PrinterAgent.exe",
+                    f"https://github.com/{AGENT_GITHUB_REPO}/releases/download/v{short_ver}/PrinterAgent.exe"
                 ]
 
                 exe_bytes = None
@@ -3637,12 +3647,13 @@ def check_and_apply_agent_auto_update(force: bool = False, verbose: bool = False
                     cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
                     subprocess.run(['cmd.exe', '/c', 'move', '/y', str(tmp_exe), str(target_exe)], capture_output=True, text=True, creationflags=cflags)
 
-                    # Reconfigurar tarea programada de Windows si existe
-                    try:
-                        sch_cmd = f'schtasks /create /tn "PrinterAgent" /tr "\"{target_exe}\" --run" /sc minute /mo 15 /f'
-                        subprocess.run(['cmd.exe', '/c', sch_cmd], capture_output=True, text=True, creationflags=cflags)
-                    except Exception:
-                        pass
+                    # Reconfigurar tareas programadas de Windows si existen
+                    for tn in ('PrinterAgent_SolutionsDev', 'PrinterAgent'):
+                        try:
+                            sch_cmd = f'schtasks /create /tn "{tn}" /tr "\"{target_exe}\" --run" /sc minute /mo 15 /f'
+                            subprocess.run(['cmd.exe', '/c', sch_cmd], capture_output=True, text=True, creationflags=cflags)
+                        except Exception:
+                            pass
 
                     # Detener procesos python residuales y lanzar PrinterAgent.exe
                     try:
@@ -4073,7 +4084,7 @@ def run_agent():
 
     # --- Auto-actualización desatendida desde GitHub Releases
     try:
-        check_and_apply_agent_auto_update()
+        check_and_apply_agent_auto_update(config=config)
     except Exception as e_auto_upd:
         log.debug(f"Auto-actualización de agente: {e_auto_upd}")
 

@@ -855,9 +855,13 @@ def scan_network_printers(network_range, community='public', timeout=0.6, snmp_p
     if priority_ips:
         for pip in priority_ips:
             pip = pip.strip()
-            if pip and pip in ips and pip not in seen:
-                ordered_ips.append(pip)
-                seen.add(pip)
+            if pip and pip not in seen:
+                try:
+                    ipaddress.ip_address(pip)
+                    ordered_ips.append(pip)
+                    seen.add(pip)
+                except ValueError:
+                    pass
 
     for aip in arp_ips:
         if aip in ips and aip not in seen:
