@@ -5495,4 +5495,5 @@ if __name__ == '__main__':
 
     elif '--run' in sys.argv:
         run_agent()
+        sys.exit(0)
 
